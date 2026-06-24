@@ -27,8 +27,9 @@
  * reported explicitly (and the process exits non-zero) instead of only scrolling
  * past in the console.
  *
- * Run:   jbang CssLookedUpColorBug.java          (or: chmod +x and ./CssLookedUpColorBug.java)
- *        Needs a display; on a headless box use:  xvfb-run jbang CssLookedUpColorBug.java
+ * Run:   jbang CssLookedUpColorBug.java            (or: chmod +x and ./CssLookedUpColorBug.java)
+ *        jbang CssLookedUpColorBug.java --forever  (keep toggling until the bug triggers)
+ *        Needs a display; on a headless box use:   xvfb-run jbang CssLookedUpColorBug.java
  */
 
 import javafx.animation.AnimationTimer;
@@ -69,11 +70,19 @@ public class CssLookedUpColorBug extends Application {
     private StackPane root;
     private boolean dark = true;
     private int toggles = 0;
-    private static final int MAX_TOGGLES = 2000;
+
+    // Stop after this many toggles, or loop forever with: jbang CssLookedUpColorBug.java --forever
+    private static final int DEFAULT_MAX_TOGGLES = 20_000;
+    private int maxToggles = DEFAULT_MAX_TOGGLES;
+    private boolean forever = false;
 
     @Override
     public void start(Stage stage) {
         installWarningDetector();
+
+        if (getParameters().getRaw().contains("--forever")) {
+            forever = true;
+        }
 
         Button btn = new Button("button-primary");
         btn.getStyleClass().setAll("button-primary");
@@ -92,7 +101,7 @@ public class CssLookedUpColorBug extends Application {
         new AnimationTimer() {
             @Override
             public void handle(long now) {
-                if (reproduced.get() || toggles >= MAX_TOGGLES) {
+                if (reproduced.get() || (!forever && toggles >= maxToggles)) {
                     stop();
                     finish();
                     return;
@@ -104,10 +113,16 @@ public class CssLookedUpColorBug extends Application {
         }.start();
     }
 
-    /** Swap the theme exactly as in the bug report: clear() then add(). */
+    /**
+     * Swap the theme exactly as in the bug report: clear() then add(). The
+     * subsequent applyCss() forces the looked-up color to be re-converted and
+     * re-cached synchronously on this pulse (the pulse would do this anyway),
+     * which is the moment the stale cached value triggers the ClassCastException.
+     */
     private void setTheme(String theme) {
         root.getStylesheets().clear();
         root.getStylesheets().add(theme);
+        root.applyCss();
     }
 
     private void finish() {
@@ -117,7 +132,8 @@ public class CssLookedUpColorBug extends Application {
             System.exit(1);
         } else {
             System.out.println("\n==> No warning observed in " + toggles
-                    + " toggles (the bug is intermittent — try running again, ideally on Linux/Wayland).");
+                    + " toggles (the bug is intermittent — try again, ideally on Linux/Wayland,"
+                    + " or run with --forever to keep toggling until it triggers).");
             Platform.exit();
             System.exit(0);
         }
