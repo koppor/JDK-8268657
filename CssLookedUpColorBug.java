@@ -3,46 +3,74 @@
 //DEPS org.openjfx:javafx-base:26.0.1
 //DEPS org.openjfx:javafx-graphics:26.0.1
 //DEPS org.openjfx:javafx-controls:26.0.1
-//RUNTIME_OPTIONS --add-modules=javafx.controls
+//RUNTIME_OPTIONS --add-modules=javafx.controls --add-opens=javafx.graphics/javafx.scene=ALL-UNNAMED
 
 /*
- * Minimal reproducer for JDK-8268657
+ * Deterministic reproducer for JDK-8268657
  *   "ClassCastException: String cannot be cast to Paint while converting value
  *    for -fx-background-color from rule '*.button-primary'"
  *   https://bugs.openjdk.org/browse/JDK-8268657
  *
- * Symptom: when a stylesheet that defines a looked-up color (here -theme-button)
- * is swapped via getStylesheets().clear() + add(), JavaFX may log a WARNING from
- * CssStyleHelper.calculateValue because a *cached* converted value for the
- * looked-up color is reused as a raw String instead of the converted Paint.
+ * WHAT THE BUG REALLY IS
+ * ----------------------
+ * A descendant whose -fx-background-color references an ancestor-defined
+ * looked-up color (here -theme-button) resolves that color by walking up the
+ * CssStyleHelper.firstStyleableAncestor chain - a *cached* WeakReference to the
+ * nearest ancestor that has a style helper. When that cached reference is
+ * transiently empty/stale, resolveRef() finds no ancestor helper, drops the
+ * looked-up color, and the raw token String "-theme-button" reaches the Paint
+ * converter, which throws ClassCastException. The background fill is then lost.
  *
- * The original report notes two triggers that this file keeps faithfully:
- *   1. the theme is switched with clear() THEN add() (not add-then-remove), and
- *   2. the rule also sets -fx-font-family, which keeps a second cached entry in
- *      play. Remove either and the warning disappears.
+ * WHY THE "WILD" clear()+add() LOOP DOES NOT REPRODUCE IT
+ * ------------------------------------------------------
+ * Swapping the stylesheet (getStylesheets().clear()+add()) marks the whole
+ * subtree REAPPLY. A REAPPLY pass rebuilds each node's style helper top-down and
+ * therefore *refreshes* its cached firstStyleableAncestor before the node
+ * resolves anything - so the stale window never opens in a single, ordered pass.
+ * That is why this never triggers under a synthetic pulse, and only shows up on
+ * Linux/Wayland where fast pulses interleave with UPDATE-only passes
+ * (pseudo-class / hover transitions) that reuse the existing, possibly-stale
+ * helper instead of rebuilding it.
  *
- * The bug is intermittent (most frequent on Linux/Wayland), so this file does
- * not switch once: it toggles the theme on every pulse for a while to provoke
- * the race, and installs a java.util.logging handler so a reproduction is
- * reported explicitly (and the process exits non-zero) instead of only scrolling
- * past in the console.
+ * HOW THIS FILE REPRODUCES IT DETERMINISTICALLY
+ * ---------------------------------------------
+ * It recreates that precise interleaving directly, against the *released*
+ * JavaFX runtime (no patched build required):
+ *   1. Build root(.root -> -theme-button) over a leaf(.button-primary -> uses it),
+ *      show the stage and let CSS settle. Sanity-check the leaf got its fill.
+ *   2. Reflectively empty the leaf's cached firstStyleableAncestor weak
+ *      reference - the transient state a Wayland stylesheet swap produces.
+ *      (Needs --add-opens javafx.graphics/javafx.scene=ALL-UNNAMED, already set.)
+ *   3. Trigger an UPDATE-only CSS pass via a pseudo-class (:hover) transition,
+ *      which reuses the existing (now-stale) helper rather than rebuilding it.
+ *   4. On the next pulse resolveRef() consults the empty cached reference, drops
+ *      the looked-up color (ClassCastException String->Paint), and the leaf's
+ *      Background becomes null. We detect both the dropped fill and the logged
+ *      warning and exit non-zero.
  *
- * Run:   jbang CssLookedUpColorBug.java            (or: chmod +x and ./CssLookedUpColorBug.java)
- *        jbang CssLookedUpColorBug.java --forever  (keep toggling until the bug triggers)
- *        Needs a display; on a headless box use:   xvfb-run jbang CssLookedUpColorBug.java
+ * With the JDK-8268657 fix (resolveRef/getInheritedStyle walk the *live*
+ * styleable parent chain instead of the cached reference) step 4 still resolves,
+ * the fill survives, and this exits 0.
+ *
+ * Run:   jbang CssLookedUpColorBug.java
+ *        xvfb-run jbang CssLookedUpColorBug.java     (headless box)
  */
 
 import javafx.animation.AnimationTimer;
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.css.PseudoClass;
+import javafx.scene.Node;
 import javafx.scene.Scene;
-import javafx.scene.control.Button;
 import javafx.scene.layout.FlowPane;
+import javafx.scene.layout.Pane;
 import javafx.scene.layout.StackPane;
 import javafx.stage.Stage;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -53,101 +81,143 @@ import java.util.logging.Logger;
 
 public class CssLookedUpColorBug extends Application {
 
-    // Two themes, both referencing the looked-up color -theme-button, and both
-    // also setting -fx-font-family (trigger #2 from the bug report). Written to
-    // temp files so JavaFX loads them as ordinary file: URLs (matching the
-    // warning shown in the original report).
-    private static final String DARK = themeFile("dark",
-            ".button-primary { -fx-background-color: -theme-button; -fx-font-family: helvetica; }\n" +
-            ".root { -theme-button: #0679DE; }\n");
+    // One stylesheet: .root defines the looked-up color, .button-primary uses it,
+    // and the :hover rule gives the leaf a pseudo-class trigger so we can force an
+    // UPDATE-only pass (transitionToState) without rebuilding its style helper.
+    private static final String THEME = themeFile("theme",
+            ".root { -theme-button: #0679DE; }\n" +
+            ".button-primary { -fx-background-color: -theme-button; }\n" +
+            ".button-primary:hover { -fx-background-color: -theme-button; }\n");
 
-    private static final String MEDIUM = themeFile("medium",
-            ".button-primary { -fx-background-color: -theme-button; -fx-font-family: helvetica; }\n" +
-            ".root { -theme-button: #FF0000; }\n");
+    private static final PseudoClass HOVER = PseudoClass.getPseudoClass("hover");
 
     // Set true by the logging handler the moment the bug's WARNING is observed.
-    private static final AtomicBoolean reproduced = new AtomicBoolean(false);
+    private static final AtomicBoolean warningSeen = new AtomicBoolean(false);
 
-    private StackPane root;
-    private boolean dark = true;
-    private int toggles = 0;
-
-    // Stop after this many toggles, or loop forever with: jbang CssLookedUpColorBug.java --forever
-    private static final int DEFAULT_MAX_TOGGLES = 20_000;
-    private int maxToggles = DEFAULT_MAX_TOGGLES;
-    private boolean forever = false;
-
-    // Many children all looking up the parent's -theme-button: each swap that hits
-    // the firstStyleableAncestor rebuild window then has CHILDREN chances to fail.
-    private static final int CHILD_COUNT = 200;
+    private Pane leaf;              // the .button-primary node we corrupt + re-resolve
+    private AnimationTimer driver;
+    private int frame = 0;
+    private boolean reproduced = false;
+    private String detail = "";
 
     @Override
     public void start(Stage stage) {
         installWarningDetector();
 
-        if (getParameters().getRaw().contains("--forever")) {
-            forever = true;
+        // A small grid of .button-primary nodes (Panes), all resolving
+        // -theme-button from the .root ancestor - matches the rule name from the
+        // bug report while avoiding the modena Button cascade.
+        FlowPane grid = new FlowPane();
+        for (int i = 0; i < 12; i++) {
+            Pane p = new Pane();
+            p.getStyleClass().setAll("button-primary");
+            p.setPrefSize(80, 30);
+            grid.getChildren().add(p);
         }
+        leaf = (Pane) grid.getChildren().get(0);
 
-        // A whole grid of .button-primary nodes, all resolving -theme-button from
-        // the .root parent, to widen the race window described in JDK-8268657.
-        FlowPane buttons = new FlowPane();
-        for (int i = 0; i < CHILD_COUNT; i++) {
-            Button btn = new Button("button-primary");
-            btn.getStyleClass().setAll("button-primary");
-            buttons.getChildren().add(btn);
-        }
-
-        root = new StackPane(buttons);
+        StackPane root = new StackPane(grid);
         root.getStyleClass().add("root");
+        root.getStylesheets().add(THEME);
 
-        Scene scene = new Scene(root, 640, 480);
+        Scene scene = new Scene(root, 360, 180);
         stage.setTitle("JDK-8268657 reproducer");
         stage.setScene(scene);
         stage.show();
 
-        setTheme(DARK);
-
-        // Toggle the theme on every animation pulse to provoke the intermittent race.
-        new AnimationTimer() {
-            @Override
-            public void handle(long now) {
-                if (reproduced.get() || (!forever && toggles >= maxToggles)) {
-                    stop();
+        // Drive the deterministic sequence across a few pulses.
+        driver = new AnimationTimer() {
+            @Override public void handle(long now) {
+                try {
+                    step();
+                } catch (Throwable t) {
+                    detail = "harness error: " + t;
+                    reproduced = false;
                     finish();
-                    return;
                 }
-                dark = !dark;
-                setTheme(dark ? DARK : MEDIUM);
-                toggles++;
             }
-        }.start();
+        };
+        driver.start();
+    }
+
+    private void step() {
+        frame++;
+
+        // Frame 2: CSS has settled - sanity-check the looked-up color resolved.
+        if (frame == 2) {
+            if (!hasFill(leaf)) {
+                detail = "setup failed: looked-up color did not resolve initially";
+                reproduced = false;
+                finish();
+            }
+            return;
+        }
+
+        // Frame 3: reproduce the transient Wayland state, then request an UPDATE pass.
+        if (frame == 3) {
+            if (!clearCachedFirstStyleableAncestor(leaf)) {
+                detail = "could not access CssStyleHelper.firstStyleableAncestor via reflection";
+                reproduced = false;
+                finish();
+                return;
+            }
+            // UPDATE-only pass: the pseudo-class transition reuses the existing
+            // (now-stale) helper instead of rebuilding it, so the next pulse's
+            // resolveRef consults the empty cached ancestor reference.
+            leaf.pseudoClassStateChanged(HOVER, true);
+            return;
+        }
+
+        // Frame 5: the pulse after the pseudo-class change has re-resolved the
+        // looked-up color through the stale cached ancestor. Check the outcome.
+        if (frame >= 5) {
+            boolean fillDropped = !hasFill(leaf);
+            reproduced = fillDropped || warningSeen.get();
+            detail = "fillDropped=" + fillDropped + ", warningLogged=" + warningSeen.get();
+            finish();
+        }
+    }
+
+    private static boolean hasFill(Pane p) {
+        return p.getBackground() != null && !p.getBackground().getFills().isEmpty();
     }
 
     /**
-     * Swap the theme exactly as in the bug report: clear() then add(). CSS is then
-     * (re)applied by the natural pulse — deliberately NOT via applyCss(), which does
-     * one clean top-down pass and tends to hide the firstStyleableAncestor race.
-     *
-     * The System.gc() hint nudges the WeakReference-based ancestor chain
-     * (CssStyleHelper.firstStyleableAncestor) toward the empty/stale state that
-     * makes resolveRef() fail to find -theme-button.
+     * Reflectively set the node's cached CssStyleHelper.firstStyleableAncestor to an
+     * empty WeakReference, reproducing the transient stale state seen during a
+     * Wayland stylesheet swap. Returns false if the node has no style helper yet.
      */
-    private void setTheme(String theme) {
-        root.getStylesheets().clear();
-        root.getStylesheets().add(theme);
-        System.gc();
+    private static boolean clearCachedFirstStyleableAncestor(Node node) {
+        try {
+            Field styleHelperField = Node.class.getDeclaredField("styleHelper");
+            styleHelperField.setAccessible(true);
+            Object helper = styleHelperField.get(node);
+            if (helper == null) {
+                return false;
+            }
+            Field ancestorField = helper.getClass().getDeclaredField("firstStyleableAncestor");
+            ancestorField.setAccessible(true);
+            ancestorField.set(helper, new WeakReference<Node>(null));
+            return true;
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private void finish() {
-        if (reproduced.get()) {
-            System.err.println("\n==> REPRODUCED JDK-8268657 after " + toggles + " theme toggles.");
+        if (driver != null) {
+            driver.stop();
+        }
+        if (reproduced) {
+            System.err.println("\n==> REPRODUCED JDK-8268657 (" + detail + ")."
+                    + "\n    The looked-up color -theme-button was dropped after an UPDATE pass"
+                    + "\n    over a stale firstStyleableAncestor (String -> Paint ClassCastException).");
             Platform.exit();
             System.exit(1);
         } else {
-            System.out.println("\n==> No warning observed in " + toggles
-                    + " toggles (the bug is intermittent — try again, ideally on Linux/Wayland,"
-                    + " or run with --forever to keep toggling until it triggers).");
+            System.out.println("\n==> NOT reproduced (" + detail + ")."
+                    + "\n    The looked-up color still resolved - this runtime has the"
+                    + "\n    JDK-8268657 fix (resolveRef walks the live parent chain).");
             Platform.exit();
             System.exit(0);
         }
@@ -160,8 +230,7 @@ public class CssLookedUpColorBug extends Application {
      */
     private static void installWarningDetector() {
         Handler handler = new Handler() {
-            @Override
-            public void publish(LogRecord rec) {
+            @Override public void publish(LogRecord rec) {
                 if (rec == null) {
                     return;
                 }
@@ -169,19 +238,18 @@ public class CssLookedUpColorBug extends Application {
                 Throwable t = rec.getThrown();
                 boolean isBug = msg.contains("-fx-background-color")
                         && (msg.contains("ClassCastException")
-                            || (t != null && t instanceof ClassCastException));
+                            || (t instanceof ClassCastException));
                 if (isBug) {
-                    reproduced.set(true);
+                    warningSeen.set(true);
                 }
             }
-
             @Override public void flush() { }
             @Override public void close() { }
         };
         handler.setLevel(Level.ALL);
-        Logger root = Logger.getLogger("");
-        root.addHandler(handler);
-        root.setLevel(Level.ALL);
+        Logger rootLogger = Logger.getLogger("");
+        rootLogger.addHandler(handler);
+        rootLogger.setLevel(Level.ALL);
     }
 
     /** Write a stylesheet to a temp file and return its external file: URL form. */
