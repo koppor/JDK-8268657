@@ -37,6 +37,7 @@ import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
+import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.StackPane;
 import javafx.stage.Stage;
 
@@ -76,6 +77,10 @@ public class CssLookedUpColorBug extends Application {
     private int maxToggles = DEFAULT_MAX_TOGGLES;
     private boolean forever = false;
 
+    // Many children all looking up the parent's -theme-button: each swap that hits
+    // the firstStyleableAncestor rebuild window then has CHILDREN chances to fail.
+    private static final int CHILD_COUNT = 200;
+
     @Override
     public void start(Stage stage) {
         installWarningDetector();
@@ -84,13 +89,19 @@ public class CssLookedUpColorBug extends Application {
             forever = true;
         }
 
-        Button btn = new Button("button-primary");
-        btn.getStyleClass().setAll("button-primary");
+        // A whole grid of .button-primary nodes, all resolving -theme-button from
+        // the .root parent, to widen the race window described in JDK-8268657.
+        FlowPane buttons = new FlowPane();
+        for (int i = 0; i < CHILD_COUNT; i++) {
+            Button btn = new Button("button-primary");
+            btn.getStyleClass().setAll("button-primary");
+            buttons.getChildren().add(btn);
+        }
 
-        root = new StackPane(btn);
+        root = new StackPane(buttons);
         root.getStyleClass().add("root");
 
-        Scene scene = new Scene(root, 320, 240);
+        Scene scene = new Scene(root, 640, 480);
         stage.setTitle("JDK-8268657 reproducer");
         stage.setScene(scene);
         stage.show();
@@ -114,15 +125,18 @@ public class CssLookedUpColorBug extends Application {
     }
 
     /**
-     * Swap the theme exactly as in the bug report: clear() then add(). The
-     * subsequent applyCss() forces the looked-up color to be re-converted and
-     * re-cached synchronously on this pulse (the pulse would do this anyway),
-     * which is the moment the stale cached value triggers the ClassCastException.
+     * Swap the theme exactly as in the bug report: clear() then add(). CSS is then
+     * (re)applied by the natural pulse — deliberately NOT via applyCss(), which does
+     * one clean top-down pass and tends to hide the firstStyleableAncestor race.
+     *
+     * The System.gc() hint nudges the WeakReference-based ancestor chain
+     * (CssStyleHelper.firstStyleableAncestor) toward the empty/stale state that
+     * makes resolveRef() fail to find -theme-button.
      */
     private void setTheme(String theme) {
         root.getStylesheets().clear();
         root.getStylesheets().add(theme);
-        root.applyCss();
+        System.gc();
     }
 
     private void finish() {
