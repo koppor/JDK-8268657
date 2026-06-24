@@ -1,0 +1,3 @@
+# jbang build cache
+.jbang/
+build/
